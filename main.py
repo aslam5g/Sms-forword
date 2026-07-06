@@ -135,9 +135,11 @@ async def list_dialogs(phone: str):
 
     dialogs = []
     async for d in client.iter_dialogs():
+        entity_username = getattr(d.entity, "username", None)
         dialogs.append({
             "id": d.id,
             "name": d.name,
+            "username": entity_username,
             "is_group": d.is_group,
             "is_channel": d.is_channel,
             "is_user": d.is_user,
