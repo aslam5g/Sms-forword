@@ -29,8 +29,8 @@ app = FastAPI(title="Telegram Auto-Forwarder")
 
 # ---- Config ----
 # Get these for free at https://my.telegram.org -> API Development Tools
-API_ID = int(os.environ.get("TG_API_ID", "0"))
-API_HASH = os.environ.get("TG_API_HASH", "")
+API_ID = int(os.environ.get("38237652", "0"))
+API_HASH = os.environ.get("626e9d50a55694d91de36bf7240f4894", "")
 
 # In-memory store for demo purposes only.
 # In production: put this in a real database (Postgres/SQLite) and ENCRYPT session strings.
