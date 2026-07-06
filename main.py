@@ -20,6 +20,7 @@ Deploy on Render exactly like your Instagram downloader:
 import os
 import asyncio
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -27,10 +28,20 @@ from telethon.errors import SessionPasswordNeededError
 
 app = FastAPI(title="Telegram Auto-Forwarder")
 
+# Allow the test frontend (or any frontend) to call this API from the browser.
+# For real production use, replace "*" with your actual frontend's domain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ---- Config ----
 # Get these for free at https://my.telegram.org -> API Development Tools
-API_ID = int(os.environ.get("38237652", "0"))
-API_HASH = os.environ.get("626e9d50a55694d91de36bf7240f4894", "")
+API_ID = int(os.environ.get("TG_API_ID", "0"))
+API_HASH = os.environ.get("TG_API_HASH", "")
 
 # In-memory store for demo purposes only.
 # In production: put this in a real database (Postgres/SQLite) and ENCRYPT session strings.
@@ -72,7 +83,11 @@ async def send_code(req: PhoneRequest):
     _require_config()
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-    sent = await client.send_code_request(req.phone)
+    try:
+        sent = await client.send_code_request(req.phone)
+    except Exception as e:
+        await client.disconnect()
+        raise HTTPException(400, f"Could not send code: {e}")
     SESSIONS[req.phone] = client  # keep connection open until verified
     return {"phone_code_hash": sent.phone_code_hash, "message": "Code sent to Telegram app."}
 
@@ -93,7 +108,12 @@ async def verify_code(req: CodeVerifyRequest):
     except SessionPasswordNeededError:
         if not req.password:
             raise HTTPException(401, "Account has 2FA enabled. Provide 'password' field.")
-        await client.sign_in(password=req.password)
+        try:
+            await client.sign_in(password=req.password)
+        except Exception as e:
+            raise HTTPException(401, f"2FA password rejected: {e}")
+    except Exception as e:
+        raise HTTPException(400, f"Verification failed: {e}")
 
     session_string = client.session.save()
     USER_SESSIONS[req.phone] = session_string
