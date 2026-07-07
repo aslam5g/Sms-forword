@@ -19,6 +19,7 @@ Deploy on Render exactly like your Instagram downloader:
 
 import os
 import asyncio
+import asyncpg
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -43,12 +44,110 @@ app.add_middleware(
 API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
 
+# Supabase/Postgres connection string. Set this in Render's Environment tab.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+db_pool: asyncpg.Pool | None = None
+
 # In-memory store for demo purposes only.
 # In production: put this in a real database (Postgres/SQLite) and ENCRYPT session strings.
 # session string = full access to a user's Telegram account. Treat it like a password.
 SESSIONS = {}          # phone -> Telethon client instance (during login)
 USER_SESSIONS = {}      # phone -> saved session string (after login)
 FORWARD_TASKS = {}      # phone -> {"source_ids": [...], "target_ids": [...], "sender": "account"|"bot", "bot_token": str, "running": bool}
+
+
+@app.on_event("startup")
+async def on_startup():
+    global db_pool
+    if not DATABASE_URL:
+        print("[warning] DATABASE_URL not set — sessions will NOT survive restarts.")
+        return
+
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_users (
+                phone TEXT PRIMARY KEY,
+                session_string TEXT NOT NULL,
+                source_ids TEXT,
+                target_ids TEXT,
+                sender TEXT,
+                bot_token TEXT,
+                running BOOLEAN DEFAULT FALSE
+            );
+        """)
+
+    # Load everything back into memory and resume any forwarding that was running.
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM telegram_users;")
+
+    for row in rows:
+        USER_SESSIONS[row["phone"]] = row["session_string"]
+        if row["running"] and row["source_ids"] and row["target_ids"]:
+            FORWARD_TASKS[row["phone"]] = {
+                "source_ids": [int(x) for x in row["source_ids"].split(",") if x],
+                "target_ids": [int(x) for x in row["target_ids"].split(",") if x],
+                "sender": row["sender"] or "account",
+                "bot_token": row["bot_token"],
+                "running": True,
+            }
+            asyncio.create_task(_run_forward_listener(row["phone"]))
+            print(f"[resume] auto-resumed forwarding for phone={row['phone']}")
+
+    print(f"[startup] loaded {len(rows)} saved user(s) from database.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if db_pool:
+        await db_pool.close()
+
+
+async def _save_session(phone: str, session_string: str):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO telegram_users (phone, session_string)
+            VALUES ($1, $2)
+            ON CONFLICT (phone) DO UPDATE SET session_string = $2;
+        """, phone, session_string)
+
+
+async def _save_forward_task(phone: str, task: dict):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE telegram_users
+            SET source_ids = $2, target_ids = $3, sender = $4, bot_token = $5, running = $6
+            WHERE phone = $1;
+        """,
+            phone,
+            ",".join(str(x) for x in task["source_ids"]),
+            ",".join(str(x) for x in task["target_ids"]),
+            task["sender"],
+            task["bot_token"],
+            task["running"],
+        )
+
+
+async def _mark_forward_stopped(phone: str):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE telegram_users SET running = FALSE WHERE phone = $1;", phone)
+
+
+@app.get("/health")
+async def health():
+    """
+    Lightweight endpoint for uptime pingers (UptimeRobot, cron-job.org, etc).
+    Pinging this every 10-14 minutes keeps the free Render instance from
+    spinning down, which also keeps active forward listeners alive.
+    """
+    return {"status": "ok", "active_forwards": len(FORWARD_TASKS), "db_connected": db_pool is not None}
 
 
 # ---------- Models ----------
@@ -119,6 +218,7 @@ async def verify_code(req: CodeVerifyRequest):
     USER_SESSIONS[req.phone] = session_string
     await client.disconnect()
     del SESSIONS[req.phone]
+    await _save_session(req.phone, session_string)
 
     return {"message": "Login successful.", "session_saved": True}
 
@@ -166,6 +266,7 @@ async def start_forwarding(req: ForwardSetupRequest):
         "bot_token": req.bot_token,
         "running": True,
     }
+    await _save_forward_task(req.phone, FORWARD_TASKS[req.phone])
 
     asyncio.create_task(_run_forward_listener(req.phone))
     return {"message": "Forwarding started.", "source_ids": req.source_ids, "target_ids": req.target_ids}
@@ -177,6 +278,7 @@ async def stop_forwarding(phone: str):
     if not task:
         raise HTTPException(404, "No active forwarding task for this phone.")
     task["running"] = False
+    await _mark_forward_stopped(phone)
     return {"message": "Forwarding stopped."}
 
 
