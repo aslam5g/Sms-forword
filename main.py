@@ -1,13 +1,11 @@
 """
-Telegram Auto-Forwarder Backend (multi-rule + keyword filter + history)
-------------------------------------------------------------------------
-Flow:
-1. User logs in with their own Telegram account (phone number + OTP) using Telethon.
-2. We list all their dialogs (groups/channels).
-3. User creates one or more forwarding RULES: each rule has its own source(s),
-   target(s), sender type (account or bot), and optional keyword filter.
-4. Each rule runs as an independent background listener.
-5. Every successful forward is logged to a history table.
+Telegram Auto-Forwarder Backend (multi-rule + keyword filter + history + hide-source)
+------------------------------------------------------------------------------------
+New in this version:
+- `hide_source` option per rule. When True, messages are sent as a fresh message
+  (copy) instead of a native Telegram "forward", so the "Forwarded from X" tag
+  does not appear. This already happens automatically when sender="bot" (bots
+  always send fresh messages). This flag makes it available for sender="account" too.
 
 Run locally:
     pip install telethon fastapi uvicorn python-multipart asyncpg
@@ -50,7 +48,7 @@ SESSIONS = {}        # phone -> Telethon client instance (during login only)
 USER_SESSIONS = {}   # phone -> saved session string (after login)
 READERS = {}         # phone -> a single shared TelegramClient used to listen for that phone
 BOT_CLIENTS = {}     # bot_token -> TelegramClient (reused across rules using the same bot)
-RULES = {}           # rule_id (int) -> rule dict (source_ids, target_ids, sender, bot_token, keywords, running, phone)
+RULES = {}           # rule_id (int) -> rule dict
 
 
 # ---------- Models ----------
@@ -71,8 +69,12 @@ class RuleCreateRequest(BaseModel):
     target_ids: list[int]
     sender: str  # "account" or "bot"
     bot_token: str | None = None
-    keywords: list[str] | None = None  # if set, only messages containing any of these are forwarded
-    label: str | None = None  # friendly name for the rule
+    keywords: list[str] | None = None
+    label: str | None = None
+    hide_source: bool = False  # NEW: send as a fresh copy instead of a native forward
+    attribution_label: str | None = None  # NEW: custom text to show instead of original source
+                                            # (e.g. "via @MyBot"). If empty, auto-detected from
+                                            # the sender account/bot's own name.
 
 
 # ---------- Helpers ----------
@@ -116,8 +118,16 @@ async def on_startup():
                 sender TEXT NOT NULL,
                 bot_token TEXT,
                 keywords TEXT,
+                hide_source BOOLEAN DEFAULT FALSE,
                 running BOOLEAN DEFAULT TRUE
             );
+        """)
+        # In case this table already existed from the previous version, add the new column.
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS hide_source BOOLEAN DEFAULT FALSE;
+        """)
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_label TEXT;
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS forward_history (
@@ -131,7 +141,6 @@ async def on_startup():
             );
         """)
 
-    # Load sessions
     async with db_pool.acquire() as conn:
         user_rows = await conn.fetch("SELECT * FROM telegram_users;")
         rule_rows = await conn.fetch("SELECT * FROM forward_rules WHERE running = TRUE;")
@@ -148,6 +157,8 @@ async def on_startup():
             "sender": row["sender"],
             "bot_token": row["bot_token"],
             "keywords": row["keywords"].split(",") if row["keywords"] else [],
+            "hide_source": row["hide_source"],
+            "attribution_label": row["attribution_label"],
             "running": True,
         }
         RULES[row["id"]] = rule
@@ -179,8 +190,8 @@ async def _insert_rule_db(rule: dict) -> int:
         return -1
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, running)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, running)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
             RETURNING id;
         """,
             rule["phone"], rule.get("label"),
@@ -188,6 +199,8 @@ async def _insert_rule_db(rule: dict) -> int:
             ",".join(str(x) for x in rule["target_ids"]),
             rule["sender"], rule["bot_token"],
             ",".join(rule["keywords"]) if rule["keywords"] else None,
+            rule["hide_source"],
+            rule.get("attribution_label"),
         )
         return row["id"]
 
@@ -311,6 +324,8 @@ async def get_rules(phone: str):
                 "target_ids": rule["target_ids"],
                 "sender": rule["sender"],
                 "keywords": rule["keywords"],
+                "hide_source": rule.get("hide_source", False),
+                "attribution_label": rule.get("attribution_label"),
                 "running": rule["running"],
             })
     return {"rules": result}
@@ -331,12 +346,14 @@ async def create_rule(req: RuleCreateRequest):
         "sender": req.sender,
         "bot_token": req.bot_token,
         "keywords": [k.strip() for k in (req.keywords or []) if k.strip()],
+        "hide_source": req.hide_source,
+        "attribution_label": (req.attribution_label or "").strip() or None,
         "running": True,
     }
 
     rule_id = await _insert_rule_db(rule)
     if rule_id == -1:
-        rule_id = (max(RULES.keys()) + 1) if RULES else 1  # fallback if no DB
+        rule_id = (max(RULES.keys()) + 1) if RULES else 1
 
     RULES[rule_id] = rule
     asyncio.create_task(_start_rule_listener(rule_id))
@@ -393,9 +410,8 @@ async def get_history(phone: str, limit: int = 50):
     }
 
 
-# ---------- Background listener (per phone reader, per rule handler) ----------
+# ---------- Background listener ----------
 async def _get_reader(phone: str) -> TelegramClient:
-    """One shared Telethon client per logged-in phone, reused by all of that phone's rules."""
     if phone in READERS:
         return READERS[phone]
     session_string = USER_SESSIONS[phone]
@@ -414,6 +430,37 @@ async def _get_bot_client(bot_token: str) -> TelegramClient:
     return bot
 
 
+async def _get_sender_display_name(sender_client: TelegramClient) -> str:
+    """Returns a human-readable label for whichever account/bot is doing the sending."""
+    me = await sender_client.get_me()
+    if getattr(me, "username", None):
+        return f"@{me.username}"
+    first = getattr(me, "first_name", "") or ""
+    last = getattr(me, "last_name", "") or ""
+    return (first + " " + last).strip() or "Unknown"
+
+
+async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: TelegramClient,
+                            event, target_id: int, text: str, attribution: str | None):
+    """
+    Sends the message to target_id either as:
+    - a native Telegram forward (keeps "Forwarded from <original source>" tag), or
+    - a fresh copy if rule['hide_source'] is True or sender is a bot (bots always send
+      fresh messages). In copy mode, if `attribution` is set, it's prepended as a small
+      header showing the sending account/bot's name instead of the original source's name.
+    """
+    use_copy_mode = rule["sender"] == "bot" or rule.get("hide_source", False)
+
+    if use_copy_mode:
+        final_text = f"{attribution}\n\n{text}" if attribution else text
+        if event.message.media:
+            await sender_client.send_file(target_id, event.message.media, caption=final_text)
+        else:
+            await sender_client.send_message(target_id, final_text)
+    else:
+        await reader.forward_messages(target_id, event.message)
+
+
 async def _start_rule_listener(rule_id: int):
     rule = RULES.get(rule_id)
     if not rule:
@@ -425,6 +472,17 @@ async def _start_rule_listener(rule_id: int):
     if rule["sender"] == "bot":
         sender_client = await _get_bot_client(rule["bot_token"])
 
+    # Resolve the attribution text once: either the user's custom label, or an
+    # auto-detected "@botname" / account name, so forwarded messages show WHO is
+    # sending them instead of the original source channel's name.
+    attribution = rule.get("attribution_label")
+    if not attribution and rule.get("hide_source"):
+        try:
+            attribution = "via " + await _get_sender_display_name(sender_client)
+        except Exception as e:
+            print(f"[attribution lookup failed] rule_id={rule_id}: {e}")
+            attribution = None
+
     @reader.on(events.NewMessage(chats=rule["source_ids"]))
     async def handler(event, rule_id=rule_id):
         current = RULES.get(rule_id)
@@ -435,15 +493,13 @@ async def _start_rule_listener(rule_id: int):
             return
         for target_id in current["target_ids"]:
             try:
-                if current["sender"] == "bot":
-                    await sender_client.send_message(target_id, text)
-                else:
-                    await reader.forward_messages(target_id, event.message)
+                await _deliver_message(current, reader, sender_client, event, target_id, text, attribution)
                 await _log_history(rule_id, phone, event.chat_id, target_id, text)
             except Exception as e:
                 print(f"[forward error] rule_id={rule_id} target={target_id}: {e}")
 
-    print(f"[listener] rule_id={rule_id} phone={phone} sources={rule['source_ids']} keywords={rule['keywords']}")
+    print(f"[listener] rule_id={rule_id} phone={phone} sources={rule['source_ids']} "
+          f"hide_source={rule.get('hide_source')} attribution={attribution!r} keywords={rule['keywords']}")
     while RULES.get(rule_id, {}).get("running"):
         await asyncio.sleep(1)
 
