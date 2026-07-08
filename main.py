@@ -18,6 +18,10 @@ Deploy on Render:
 
 import os
 import asyncio
+import hashlib
+import json
+import re
+from collections import deque
 import asyncpg
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,6 +53,9 @@ USER_SESSIONS = {}   # phone -> saved session string (after login)
 READERS = {}         # phone -> a single shared TelegramClient used to listen for that phone
 BOT_CLIENTS = {}     # bot_token -> TelegramClient (reused across rules using the same bot)
 RULES = {}           # rule_id (int) -> rule dict
+SEEN_HASHES = {}     # rule_id -> deque of recent content hashes (bounded window)
+SEEN_SETS = {}       # rule_id -> set of the same hashes, for O(1) duplicate lookup
+DUPLICATE_WINDOW = 200  # how many recent messages per rule we remember for dedup
 
 
 # ---------- Models ----------
@@ -63,6 +70,18 @@ class CodeVerifyRequest(BaseModel):
     password: str | None = None
 
 
+class ReplaceRule(BaseModel):
+    find: str
+    replace: str = ""
+
+
+class CleanerOptions(BaseModel):
+    remove_links: bool = False
+    remove_mentions: bool = False
+    remove_emojis: bool = False
+    remove_hashtags: bool = False
+
+
 class RuleCreateRequest(BaseModel):
     phone: str
     source_ids: list[int]
@@ -75,6 +94,12 @@ class RuleCreateRequest(BaseModel):
     attribution_label: str | None = None  # NEW: custom text to show instead of original source
                                             # (e.g. "via @MyBot"). If empty, auto-detected from
                                             # the sender account/bot's own name.
+    duplicate_filter: bool = False  # NEW: skip forwarding a message whose content was already
+                                      # forwarded recently by this same rule
+    header_text: str | None = None  # NEW: text prepended to every forwarded message
+    footer_text: str | None = None  # NEW: text appended to every forwarded message
+    replace_rules: list[ReplaceRule] | None = None  # NEW: find/replace pairs applied to text
+    cleaner_options: CleanerOptions | None = None  # NEW: strip links/mentions/emojis/hashtags
 
 
 # ---------- Helpers ----------
@@ -90,6 +115,75 @@ def _matches_keywords(text: str, keywords: list[str]) -> bool:
         return False
     lowered = text.lower()
     return any(kw.lower() in lowered for kw in keywords)
+
+
+_LINK_PATTERN = re.compile(r'(https?://\S+|www\.\S+|t\.me/\S+)', re.IGNORECASE)
+_MENTION_PATTERN = re.compile(r'@\w+')
+_HASHTAG_PATTERN = re.compile(r'#\w+')
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # symbols & pictographs, supplemental symbols, emoticons, etc.
+    "\U00002600-\U000027BF"  # misc symbols & dingbats
+    "\U0001F1E6-\U0001F1FF"  # regional indicator (flags)
+    "\U00002700-\U000027BF"
+    "\U0001F900-\U0001F9FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _apply_cleaner(text: str, options: dict | None) -> str:
+    if not options:
+        return text
+    if options.get("remove_links"):
+        text = _LINK_PATTERN.sub("", text)
+    if options.get("remove_mentions"):
+        text = _MENTION_PATTERN.sub("", text)
+    if options.get("remove_hashtags"):
+        text = _HASHTAG_PATTERN.sub("", text)
+    if options.get("remove_emojis"):
+        text = _EMOJI_PATTERN.sub("", text)
+    # collapse extra blank lines/spaces left behind by removals
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def _apply_replacements(text: str, replace_rules: list) -> str:
+    for r in (replace_rules or []):
+        find = r.get("find", "")
+        repl = r.get("replace", "")
+        if find:
+            text = text.replace(find, repl)
+    return text
+
+
+def _content_hash(event) -> str:
+    """
+    A fingerprint for the message's content, used for duplicate detection.
+    Text messages are hashed by their normalized text; media-only messages
+    fall back to the file's unique id (or the message id as a last resort).
+    """
+    text = (event.message.message or "").strip().lower()
+    if text:
+        basis = text
+    else:
+        file_id = getattr(getattr(event.message, "file", None), "id", None)
+        basis = f"media:{file_id}" if file_id else f"msgid:{event.message.id}"
+    return hashlib.md5(basis.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _is_duplicate(rule_id: int, content_hash: str) -> bool:
+    return content_hash in SEEN_SETS.get(rule_id, set())
+
+
+def _mark_seen(rule_id: int, content_hash: str):
+    dq = SEEN_HASHES.setdefault(rule_id, deque(maxlen=DUPLICATE_WINDOW))
+    s = SEEN_SETS.setdefault(rule_id, set())
+    if len(dq) == dq.maxlen:
+        s.discard(dq[0])  # about to be evicted by the append below
+    dq.append(content_hash)
+    s.add(content_hash)
 
 
 # ---------- DB lifecycle ----------
@@ -130,6 +224,21 @@ async def on_startup():
             ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_label TEXT;
         """)
         await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS duplicate_filter BOOLEAN DEFAULT FALSE;
+        """)
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS header_text TEXT;
+        """)
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS footer_text TEXT;
+        """)
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS replace_rules TEXT;
+        """)
+        await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS cleaner_options TEXT;
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS forward_history (
                 id SERIAL PRIMARY KEY,
                 rule_id INTEGER,
@@ -159,6 +268,11 @@ async def on_startup():
             "keywords": row["keywords"].split(",") if row["keywords"] else [],
             "hide_source": row["hide_source"],
             "attribution_label": row["attribution_label"],
+            "duplicate_filter": row["duplicate_filter"],
+            "header_text": row["header_text"],
+            "footer_text": row["footer_text"],
+            "replace_rules": json.loads(row["replace_rules"]) if row["replace_rules"] else [],
+            "cleaner_options": json.loads(row["cleaner_options"]) if row["cleaner_options"] else None,
             "running": True,
         }
         RULES[row["id"]] = rule
@@ -190,8 +304,8 @@ async def _insert_rule_db(rule: dict) -> int:
         return -1
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, running)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, duplicate_filter, header_text, footer_text, replace_rules, cleaner_options, running)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
             RETURNING id;
         """,
             rule["phone"], rule.get("label"),
@@ -201,6 +315,11 @@ async def _insert_rule_db(rule: dict) -> int:
             ",".join(rule["keywords"]) if rule["keywords"] else None,
             rule["hide_source"],
             rule.get("attribution_label"),
+            rule.get("duplicate_filter", False),
+            rule.get("header_text"),
+            rule.get("footer_text"),
+            json.dumps(rule["replace_rules"]) if rule.get("replace_rules") else None,
+            json.dumps(rule["cleaner_options"]) if rule.get("cleaner_options") else None,
         )
         return row["id"]
 
@@ -326,6 +445,11 @@ async def get_rules(phone: str):
                 "keywords": rule["keywords"],
                 "hide_source": rule.get("hide_source", False),
                 "attribution_label": rule.get("attribution_label"),
+                "duplicate_filter": rule.get("duplicate_filter", False),
+                "header_text": rule.get("header_text"),
+                "footer_text": rule.get("footer_text"),
+                "replace_rules": rule.get("replace_rules") or [],
+                "cleaner_options": rule.get("cleaner_options"),
                 "running": rule["running"],
             })
     return {"rules": result}
@@ -348,6 +472,11 @@ async def create_rule(req: RuleCreateRequest):
         "keywords": [k.strip() for k in (req.keywords or []) if k.strip()],
         "hide_source": req.hide_source,
         "attribution_label": (req.attribution_label or "").strip() or None,
+        "duplicate_filter": req.duplicate_filter,
+        "header_text": (req.header_text or "").strip() or None,
+        "footer_text": (req.footer_text or "").strip() or None,
+        "replace_rules": [r.dict() for r in (req.replace_rules or [])],
+        "cleaner_options": req.cleaner_options.dict() if req.cleaner_options else None,
         "running": True,
     }
 
@@ -379,6 +508,8 @@ async def delete_rule(rule_id: int):
     rule["running"] = False
     await _delete_rule_db(rule_id)
     del RULES[rule_id]
+    SEEN_HASHES.pop(rule_id, None)
+    SEEN_SETS.pop(rule_id, None)
     return {"message": "Rule deleted."}
 
 
@@ -440,19 +571,42 @@ async def _get_sender_display_name(sender_client: TelegramClient) -> str:
     return (first + " " + last).strip() or "Unknown"
 
 
+def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
+    """Builds the outgoing message: attribution line, then header, then the
+    cleaned + find/replace-processed original text, then footer — each optional."""
+    text = _apply_cleaner(text, rule.get("cleaner_options"))
+    text = _apply_replacements(text, rule.get("replace_rules"))
+    parts = []
+    if attribution:
+        parts.append(attribution)
+    if rule.get("header_text"):
+        parts.append(rule["header_text"])
+    parts.append(text)
+    if rule.get("footer_text"):
+        parts.append(rule["footer_text"])
+    return "\n\n".join(p for p in parts if p)
+
+
 async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: TelegramClient,
                             event, target_id: int, text: str, attribution: str | None):
     """
     Sends the message to target_id either as:
     - a native Telegram forward (keeps "Forwarded from <original source>" tag), or
-    - a fresh copy if rule['hide_source'] is True or sender is a bot (bots always send
-      fresh messages). In copy mode, if `attribution` is set, it's prepended as a small
-      header showing the sending account/bot's name instead of the original source's name.
+    - a fresh copy if rule['hide_source'] is True, sender is a bot, or a header/footer/
+      replace rule/cleaner option is configured (native forwards can't be edited, so
+      any of these force copy mode).
     """
-    use_copy_mode = rule["sender"] == "bot" or rule.get("hide_source", False)
+    use_copy_mode = (
+        rule["sender"] == "bot"
+        or rule.get("hide_source", False)
+        or bool(rule.get("header_text"))
+        or bool(rule.get("footer_text"))
+        or bool(rule.get("replace_rules"))
+        or bool(rule.get("cleaner_options") and any(rule["cleaner_options"].values()))
+    )
 
     if use_copy_mode:
-        final_text = f"{attribution}\n\n{text}" if attribution else text
+        final_text = _compose_final_text(rule, attribution, text)
         if event.message.media:
             await sender_client.send_file(target_id, event.message.media, caption=final_text)
         else:
@@ -491,6 +645,14 @@ async def _start_rule_listener(rule_id: int):
         text = event.message.message or ""
         if not _matches_keywords(text, current["keywords"]):
             return
+
+        if current.get("duplicate_filter"):
+            content_hash = _content_hash(event)
+            if _is_duplicate(rule_id, content_hash):
+                print(f"[duplicate skipped] rule_id={rule_id} hash={content_hash}")
+                return
+            _mark_seen(rule_id, content_hash)
+
         for target_id in current["target_ids"]:
             try:
                 await _deliver_message(current, reader, sender_client, event, target_id, text, attribution)
