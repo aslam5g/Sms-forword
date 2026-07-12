@@ -1,11 +1,14 @@
 """
 Telegram Auto-Forwarder Backend (multi-rule + keyword filter + history + hide-source)
 ------------------------------------------------------------------------------------
-New in this version:
-- `hide_source` option per rule. When True, messages are sent as a fresh message
-  (copy) instead of a native Telegram "forward", so the "Forwarded from X" tag
-  does not appear. This already happens automatically when sender="bot" (bots
-  always send fresh messages). This flag makes it available for sender="account" too.
+FIX in this version:
+- `_get_reader()` and `_get_bot_client()` now check if the cached TelegramClient
+  is still connected before reusing it. Render's free plan puts the server to
+  sleep after ~15 minutes idle, which silently disconnects the Telethon client.
+  Previously, the dead client stayed cached in READERS/BOT_CLIENTS forever, so
+  ALL rules (old and new) using that phone/bot would silently stop forwarding
+  even though they showed "running: true". Now it reconnects automatically,
+  or rebuilds the client if reconnect fails.
 
 Run locally:
     pip install telethon fastapi uvicorn python-multipart asyncpg
@@ -94,20 +97,14 @@ class RuleCreateRequest(BaseModel):
     bot_token: str | None = None
     keywords: list[str] | None = None
     label: str | None = None
-    hide_source: bool = False  # NEW: send as a fresh copy instead of a native forward
-    attribution_label: str | None = None  # NEW: custom text to show instead of original source
-                                            # (e.g. "via @MyBot"). If empty, auto-detected from
-                                            # the sender account/bot's own name.
-    attribution_mode: str = "sender"  # NEW: "sender" = show sending account/bot's name (old default),
-                                        # "target" = show the destination channel's OWN name + t.me
-                                        # link instead (like a manual post would look). Ignored if
-                                        # attribution_label is set (that always wins).
-    duplicate_filter: bool = False  # NEW: skip forwarding a message whose content was already
-                                      # forwarded recently by this same rule
-    header_text: str | None = None  # NEW: text prepended to every forwarded message
-    footer_text: str | None = None  # NEW: text appended to every forwarded message
-    replace_rules: list[ReplaceRule] | None = None  # NEW: find/replace pairs applied to text
-    cleaner_options: CleanerOptions | None = None  # NEW: strip links/mentions/emojis/hashtags
+    hide_source: bool = False
+    attribution_label: str | None = None
+    attribution_mode: str = "sender"
+    duplicate_filter: bool = False
+    header_text: str | None = None
+    footer_text: str | None = None
+    replace_rules: list[ReplaceRule] | None = None
+    cleaner_options: CleanerOptions | None = None
 
 
 # ---------- Helpers ----------
@@ -130,9 +127,9 @@ _MENTION_PATTERN = re.compile(r'@\w+')
 _HASHTAG_PATTERN = re.compile(r'#\w+')
 _EMOJI_PATTERN = re.compile(
     "["
-    "\U0001F300-\U0001FAFF"  # symbols & pictographs, supplemental symbols, emoticons, etc.
-    "\U00002600-\U000027BF"  # misc symbols & dingbats
-    "\U0001F1E6-\U0001F1FF"  # regional indicator (flags)
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
     "\U00002700-\U000027BF"
     "\U0001F900-\U0001F9FF"
     "]+",
@@ -151,7 +148,6 @@ def _apply_cleaner(text: str, options: dict | None) -> str:
         text = _HASHTAG_PATTERN.sub("", text)
     if options.get("remove_emojis"):
         text = _EMOJI_PATTERN.sub("", text)
-    # collapse extra blank lines/spaces left behind by removals
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
@@ -167,11 +163,6 @@ def _apply_replacements(text: str, replace_rules: list) -> str:
 
 
 def _content_hash(event) -> str:
-    """
-    A fingerprint for the message's content, used for duplicate detection.
-    Text messages are hashed by their normalized text; media-only messages
-    fall back to the file's unique id (or the message id as a last resort).
-    """
     text = (event.message.message or "").strip().lower()
     if text:
         basis = text
@@ -189,7 +180,7 @@ def _mark_seen(rule_id: int, content_hash: str):
     dq = SEEN_HASHES.setdefault(rule_id, deque(maxlen=DUPLICATE_WINDOW))
     s = SEEN_SETS.setdefault(rule_id, set())
     if len(dq) == dq.maxlen:
-        s.discard(dq[0])  # about to be evicted by the append below
+        s.discard(dq[0])
     dq.append(content_hash)
     s.add(content_hash)
 
@@ -230,7 +221,6 @@ async def on_startup():
                 running BOOLEAN DEFAULT TRUE
             );
         """)
-        # In case this table already existed from the previous version, add the new column.
         await conn.execute("""
             ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS hide_source BOOLEAN DEFAULT FALSE;
         """)
@@ -303,11 +293,38 @@ async def on_startup():
 
     print(f"[startup] loaded {len(user_rows)} user(s) and {len(rule_rows)} active rule(s) from database.")
 
+    # NEW: background task that pings all cached readers/bots periodically so
+    # Telethon's own keep-alive pings don't go stale for long idle stretches,
+    # and so a dead connection gets detected+repaired proactively rather than
+    # only when the next message tries to use it.
+    asyncio.create_task(_connection_watchdog())
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
     if db_pool:
         await db_pool.close()
+
+
+async def _connection_watchdog():
+    """Every 5 minutes, check all cached reader/bot clients and reconnect any
+    that have silently dropped (e.g. after the Render instance slept)."""
+    while True:
+        await asyncio.sleep(300)
+        for phone, client in list(READERS.items()):
+            try:
+                if not client.is_connected():
+                    print(f"[watchdog] reader for {phone} disconnected, reconnecting...")
+                    await client.connect()
+            except Exception as e:
+                print(f"[watchdog] reader reconnect failed for {phone}: {e}")
+        for token, client in list(BOT_CLIENTS.items()):
+            try:
+                if not client.is_connected():
+                    print(f"[watchdog] bot client disconnected, reconnecting...")
+                    await client.connect()
+            except Exception as e:
+                print(f"[watchdog] bot reconnect failed: {e}")
 
 
 async def _save_session(phone: str, session_string: str):
@@ -322,10 +339,6 @@ async def _save_session(phone: str, session_string: str):
 
 
 async def _create_token(phone: str) -> str:
-    """Creates a persistent login token for this phone. The app stores this on
-    the device and sends it with every request instead of trusting a bare phone
-    number, so a stranger who merely knows the phone number can't hijack the
-    account. The token survives app restarts and server restarts (saved to DB)."""
     token = secrets.token_urlsafe(32)
     AUTH_TOKENS[token] = phone
     if db_pool:
@@ -384,6 +397,13 @@ async def _mark_rule_stopped(rule_id: int):
         await conn.execute("UPDATE forward_rules SET running = FALSE WHERE id = $1;", rule_id)
 
 
+async def _mark_rule_running(rule_id: int):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE forward_rules SET running = TRUE WHERE id = $1;", rule_id)
+
+
 async def _delete_rule_db(rule_id: int):
     if not db_pool:
         return
@@ -403,10 +423,12 @@ async def _log_history(rule_id: int, phone: str, source_id: int, target_id: int,
 
 @app.get("/health")
 async def health():
+    reader_status = {phone: c.is_connected() for phone, c in READERS.items()}
     return {
         "status": "ok",
         "active_rules": len([r for r in RULES.values() if r["running"]]),
         "db_connected": db_pool is not None,
+        "readers_connected": reader_status,
     }
 
 
@@ -460,8 +482,6 @@ async def verify_code(req: CodeVerifyRequest):
 
 @app.get("/me")
 async def me(token: str):
-    """The app calls this on launch to check if a saved token is still valid,
-    so it can skip straight to the dashboard instead of showing the login screen."""
     phone = _phone_for_token(token)
     return {"phone": phone}
 
@@ -580,6 +600,22 @@ async def stop_rule(rule_id: int, token: str):
     return {"message": "Rule stopped."}
 
 
+# NEW: resume a stopped rule without deleting/recreating it.
+@app.post("/forward/rules/{rule_id}/resume")
+async def resume_rule(rule_id: int, token: str):
+    rule = RULES.get(rule_id)
+    if not rule:
+        raise HTTPException(404, "Rule not found.")
+    if _phone_for_token(token) != rule["phone"]:
+        raise HTTPException(401, "Not authorized for this rule.")
+    if rule["running"]:
+        return {"message": "Rule already running."}
+    rule["running"] = True
+    await _mark_rule_running(rule_id)
+    asyncio.create_task(_start_rule_listener(rule_id))
+    return {"message": "Rule resumed."}
+
+
 @app.delete("/forward/rules/{rule_id}")
 async def delete_rule(rule_id: int, token: str):
     rule = RULES.get(rule_id)
@@ -627,8 +663,28 @@ async def get_history(phone: str, token: str, limit: int = 50):
 
 # ---------- Background listener ----------
 async def _get_reader(phone: str) -> TelegramClient:
+    """
+    Returns a connected TelegramClient for this phone, reusing the cached one
+    if it's still alive. FIX: previously this returned the cached client even
+    if it had silently disconnected (e.g. after Render's free-tier server went
+    to sleep), which meant every rule using this phone would stop forwarding
+    forever, even brand-new rules created after the disconnect.
+    """
     if phone in READERS:
-        return READERS[phone]
+        existing = READERS[phone]
+        if existing.is_connected():
+            return existing
+        try:
+            print(f"[reader] {phone} was disconnected, attempting reconnect...")
+            await existing.connect()
+            if existing.is_connected():
+                print(f"[reader] {phone} reconnected successfully.")
+                return existing
+        except Exception as e:
+            print(f"[reader] reconnect failed for {phone}: {e}")
+        # Reconnect failed — drop it and build a fresh client below.
+        READERS.pop(phone, None)
+
     session_string = USER_SESSIONS[phone]
     reader = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await reader.connect()
@@ -637,8 +693,21 @@ async def _get_reader(phone: str) -> TelegramClient:
 
 
 async def _get_bot_client(bot_token: str) -> TelegramClient:
+    """Same fix as _get_reader: check liveness before reusing a cached bot client."""
     if bot_token in BOT_CLIENTS:
-        return BOT_CLIENTS[bot_token]
+        existing = BOT_CLIENTS[bot_token]
+        if existing.is_connected():
+            return existing
+        try:
+            print("[bot] client was disconnected, attempting reconnect...")
+            await existing.connect()
+            if existing.is_connected():
+                print("[bot] reconnected successfully.")
+                return existing
+        except Exception as e:
+            print(f"[bot] reconnect failed: {e}")
+        BOT_CLIENTS.pop(bot_token, None)
+
     bot = TelegramClient(StringSession(), API_ID, API_HASH)
     await bot.start(bot_token=bot_token)
     BOT_CLIENTS[bot_token] = bot
@@ -646,11 +715,6 @@ async def _get_bot_client(bot_token: str) -> TelegramClient:
 
 
 async def _get_target_label(client: TelegramClient, target_id: int) -> str:
-    """
-    Returns a label for the TARGET chat itself — its title, plus a t.me link if
-    it's public — so a forwarded message can show "posted in <this channel>"
-    instead of "Forwarded from <original source>". Cached since it rarely changes.
-    """
     if target_id in TARGET_LABEL_CACHE:
         return TARGET_LABEL_CACHE[target_id]
     try:
@@ -666,7 +730,6 @@ async def _get_target_label(client: TelegramClient, target_id: int) -> str:
 
 
 async def _get_sender_display_name(sender_client: TelegramClient) -> str:
-    """Returns a human-readable label for whichever account/bot is doing the sending."""
     me = await sender_client.get_me()
     if getattr(me, "username", None):
         return f"@{me.username}"
@@ -676,8 +739,6 @@ async def _get_sender_display_name(sender_client: TelegramClient) -> str:
 
 
 def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
-    """Builds the outgoing message: attribution line, then header, then the
-    cleaned + find/replace-processed original text, then footer — each optional."""
     text = _apply_cleaner(text, rule.get("cleaner_options"))
     text = _apply_replacements(text, rule.get("replace_rules"))
     parts = []
@@ -693,13 +754,6 @@ def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
 
 async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: TelegramClient,
                             event, target_id: int, text: str, attribution: str | None):
-    """
-    Sends the message to target_id either as:
-    - a native Telegram forward (keeps "Forwarded from <original source>" tag), or
-    - a fresh copy if rule['hide_source'] is True, sender is a bot, or a header/footer/
-      replace rule/cleaner option is configured (native forwards can't be edited, so
-      any of these force copy mode).
-    """
     use_copy_mode = (
         rule["sender"] == "bot"
         or rule.get("hide_source", False)
@@ -730,10 +784,6 @@ async def _start_rule_listener(rule_id: int):
     if rule["sender"] == "bot":
         sender_client = await _get_bot_client(rule["bot_token"])
 
-    # Resolve the attribution text once if it doesn't depend on the target:
-    # a custom label always wins; otherwise "sender" mode auto-detects the
-    # sending account/bot's own name up front. "target" mode is resolved
-    # per-target inside the handler below, since each target has its own name.
     attribution = rule.get("attribution_label")
     if not attribution and rule.get("hide_source") and rule.get("attribution_mode", "sender") == "sender":
         try:
