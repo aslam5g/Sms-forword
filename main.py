@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 from collections import deque
 import asyncpg
 from fastapi import FastAPI, HTTPException
@@ -50,9 +51,11 @@ db_pool: asyncpg.Pool | None = None
 # ---- In-memory state ----
 SESSIONS = {}        # phone -> Telethon client instance (during login only)
 USER_SESSIONS = {}   # phone -> saved session string (after login)
+AUTH_TOKENS = {}     # token -> phone (persistent login, survives app restarts on the device)
 READERS = {}         # phone -> a single shared TelegramClient used to listen for that phone
 BOT_CLIENTS = {}     # bot_token -> TelegramClient (reused across rules using the same bot)
 RULES = {}           # rule_id (int) -> rule dict
+TARGET_LABEL_CACHE = {}  # target_id -> "Title\nhttps://t.me/username" (or without link if private)
 SEEN_HASHES = {}     # rule_id -> deque of recent content hashes (bounded window)
 SEEN_SETS = {}       # rule_id -> set of the same hashes, for O(1) duplicate lookup
 DUPLICATE_WINDOW = 200  # how many recent messages per rule we remember for dedup
@@ -84,6 +87,7 @@ class CleanerOptions(BaseModel):
 
 class RuleCreateRequest(BaseModel):
     phone: str
+    token: str
     source_ids: list[int]
     target_ids: list[int]
     sender: str  # "account" or "bot"
@@ -94,6 +98,10 @@ class RuleCreateRequest(BaseModel):
     attribution_label: str | None = None  # NEW: custom text to show instead of original source
                                             # (e.g. "via @MyBot"). If empty, auto-detected from
                                             # the sender account/bot's own name.
+    attribution_mode: str = "sender"  # NEW: "sender" = show sending account/bot's name (old default),
+                                        # "target" = show the destination channel's OWN name + t.me
+                                        # link instead (like a manual post would look). Ignored if
+                                        # attribution_label is set (that always wins).
     duplicate_filter: bool = False  # NEW: skip forwarding a message whose content was already
                                       # forwarded recently by this same rule
     header_text: str | None = None  # NEW: text prepended to every forwarded message
@@ -203,6 +211,12 @@ async def on_startup():
             );
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token TEXT PRIMARY KEY,
+                phone TEXT NOT NULL
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS forward_rules (
                 id SERIAL PRIMARY KEY,
                 phone TEXT NOT NULL,
@@ -239,6 +253,9 @@ async def on_startup():
             ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS cleaner_options TEXT;
         """)
         await conn.execute("""
+            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_mode TEXT DEFAULT 'sender';
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS forward_history (
                 id SERIAL PRIMARY KEY,
                 rule_id INTEGER,
@@ -252,10 +269,14 @@ async def on_startup():
 
     async with db_pool.acquire() as conn:
         user_rows = await conn.fetch("SELECT * FROM telegram_users;")
+        token_rows = await conn.fetch("SELECT * FROM auth_tokens;")
         rule_rows = await conn.fetch("SELECT * FROM forward_rules WHERE running = TRUE;")
 
     for row in user_rows:
         USER_SESSIONS[row["phone"]] = row["session_string"]
+
+    for row in token_rows:
+        AUTH_TOKENS[row["token"]] = row["phone"]
 
     for row in rule_rows:
         rule = {
@@ -273,6 +294,7 @@ async def on_startup():
             "footer_text": row["footer_text"],
             "replace_rules": json.loads(row["replace_rules"]) if row["replace_rules"] else [],
             "cleaner_options": json.loads(row["cleaner_options"]) if row["cleaner_options"] else None,
+            "attribution_mode": row["attribution_mode"] or "sender",
             "running": True,
         }
         RULES[row["id"]] = rule
@@ -299,13 +321,43 @@ async def _save_session(phone: str, session_string: str):
         """, phone, session_string)
 
 
+async def _create_token(phone: str) -> str:
+    """Creates a persistent login token for this phone. The app stores this on
+    the device and sends it with every request instead of trusting a bare phone
+    number, so a stranger who merely knows the phone number can't hijack the
+    account. The token survives app restarts and server restarts (saved to DB)."""
+    token = secrets.token_urlsafe(32)
+    AUTH_TOKENS[token] = phone
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO auth_tokens (token, phone) VALUES ($1, $2) ON CONFLICT (token) DO NOTHING;",
+                token, phone,
+            )
+    return token
+
+
+def _phone_for_token(token: str) -> str:
+    phone = AUTH_TOKENS.get(token)
+    if not phone:
+        raise HTTPException(401, "Invalid or expired session. Please log in again.")
+    return phone
+
+
+async def _delete_token(token: str):
+    AUTH_TOKENS.pop(token, None)
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM auth_tokens WHERE token = $1;", token)
+
+
 async def _insert_rule_db(rule: dict) -> int:
     if not db_pool:
         return -1
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, duplicate_filter, header_text, footer_text, replace_rules, cleaner_options, running)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
+            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, duplicate_filter, header_text, footer_text, replace_rules, cleaner_options, attribution_mode, running)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
             RETURNING id;
         """,
             rule["phone"], rule.get("label"),
@@ -320,6 +372,7 @@ async def _insert_rule_db(rule: dict) -> int:
             rule.get("footer_text"),
             json.dumps(rule["replace_rules"]) if rule.get("replace_rules") else None,
             json.dumps(rule["cleaner_options"]) if rule.get("cleaner_options") else None,
+            rule.get("attribution_mode", "sender"),
         )
         return row["id"]
 
@@ -400,13 +453,32 @@ async def verify_code(req: CodeVerifyRequest):
     await client.disconnect()
     del SESSIONS[req.phone]
     await _save_session(req.phone, session_string)
+    token = await _create_token(req.phone)
 
-    return {"message": "Login successful.", "session_saved": True}
+    return {"message": "Login successful.", "session_saved": True, "token": token, "phone": req.phone}
+
+
+@app.get("/me")
+async def me(token: str):
+    """The app calls this on launch to check if a saved token is still valid,
+    so it can skip straight to the dashboard instead of showing the login screen."""
+    phone = _phone_for_token(token)
+    return {"phone": phone}
+
+
+@app.post("/logout")
+async def logout(req: dict):
+    token = req.get("token")
+    if token:
+        await _delete_token(token)
+    return {"message": "Logged out."}
 
 
 # ---------- 3. List dialogs ----------
 @app.get("/dialogs")
-async def list_dialogs(phone: str):
+async def list_dialogs(phone: str, token: str):
+    if _phone_for_token(token) != phone:
+        raise HTTPException(401, "Token does not match this phone.")
     session_string = USER_SESSIONS.get(phone)
     if not session_string:
         raise HTTPException(401, "Not logged in. Complete /login/verify first.")
@@ -432,7 +504,9 @@ async def list_dialogs(phone: str):
 
 # ---------- 4. Forwarding rules (multi-rule) ----------
 @app.get("/forward/rules")
-async def get_rules(phone: str):
+async def get_rules(phone: str, token: str):
+    if _phone_for_token(token) != phone:
+        raise HTTPException(401, "Token does not match this phone.")
     result = []
     for rule_id, rule in RULES.items():
         if rule["phone"] == phone:
@@ -450,6 +524,7 @@ async def get_rules(phone: str):
                 "footer_text": rule.get("footer_text"),
                 "replace_rules": rule.get("replace_rules") or [],
                 "cleaner_options": rule.get("cleaner_options"),
+                "attribution_mode": rule.get("attribution_mode", "sender"),
                 "running": rule["running"],
             })
     return {"rules": result}
@@ -457,6 +532,8 @@ async def get_rules(phone: str):
 
 @app.post("/forward/rules")
 async def create_rule(req: RuleCreateRequest):
+    if _phone_for_token(req.token) != req.phone:
+        raise HTTPException(401, "Token does not match this phone.")
     if req.phone not in USER_SESSIONS:
         raise HTTPException(401, "Not logged in.")
     if req.sender == "bot" and not req.bot_token:
@@ -477,6 +554,7 @@ async def create_rule(req: RuleCreateRequest):
         "footer_text": (req.footer_text or "").strip() or None,
         "replace_rules": [r.dict() for r in (req.replace_rules or [])],
         "cleaner_options": req.cleaner_options.dict() if req.cleaner_options else None,
+        "attribution_mode": req.attribution_mode if req.attribution_mode in ("sender", "target") else "sender",
         "running": True,
     }
 
@@ -491,20 +569,24 @@ async def create_rule(req: RuleCreateRequest):
 
 
 @app.post("/forward/rules/{rule_id}/stop")
-async def stop_rule(rule_id: int):
+async def stop_rule(rule_id: int, token: str):
     rule = RULES.get(rule_id)
     if not rule:
         raise HTTPException(404, "Rule not found.")
+    if _phone_for_token(token) != rule["phone"]:
+        raise HTTPException(401, "Not authorized for this rule.")
     rule["running"] = False
     await _mark_rule_stopped(rule_id)
     return {"message": "Rule stopped."}
 
 
 @app.delete("/forward/rules/{rule_id}")
-async def delete_rule(rule_id: int):
+async def delete_rule(rule_id: int, token: str):
     rule = RULES.get(rule_id)
     if not rule:
         raise HTTPException(404, "Rule not found.")
+    if _phone_for_token(token) != rule["phone"]:
+        raise HTTPException(401, "Not authorized for this rule.")
     rule["running"] = False
     await _delete_rule_db(rule_id)
     del RULES[rule_id]
@@ -515,7 +597,9 @@ async def delete_rule(rule_id: int):
 
 # ---------- 5. History ----------
 @app.get("/forward/history")
-async def get_history(phone: str, limit: int = 50):
+async def get_history(phone: str, token: str, limit: int = 50):
+    if _phone_for_token(token) != phone:
+        raise HTTPException(401, "Token does not match this phone.")
     if not db_pool:
         return {"history": []}
     async with db_pool.acquire() as conn:
@@ -559,6 +643,26 @@ async def _get_bot_client(bot_token: str) -> TelegramClient:
     await bot.start(bot_token=bot_token)
     BOT_CLIENTS[bot_token] = bot
     return bot
+
+
+async def _get_target_label(client: TelegramClient, target_id: int) -> str:
+    """
+    Returns a label for the TARGET chat itself — its title, plus a t.me link if
+    it's public — so a forwarded message can show "posted in <this channel>"
+    instead of "Forwarded from <original source>". Cached since it rarely changes.
+    """
+    if target_id in TARGET_LABEL_CACHE:
+        return TARGET_LABEL_CACHE[target_id]
+    try:
+        entity = await client.get_entity(target_id)
+        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or "Channel"
+        username = getattr(entity, "username", None)
+        label = f"{title}\nhttps://t.me/{username}" if username else title
+    except Exception as e:
+        print(f"[target label lookup failed] target={target_id}: {e}")
+        label = ""
+    TARGET_LABEL_CACHE[target_id] = label
+    return label
 
 
 async def _get_sender_display_name(sender_client: TelegramClient) -> str:
@@ -626,11 +730,12 @@ async def _start_rule_listener(rule_id: int):
     if rule["sender"] == "bot":
         sender_client = await _get_bot_client(rule["bot_token"])
 
-    # Resolve the attribution text once: either the user's custom label, or an
-    # auto-detected "@botname" / account name, so forwarded messages show WHO is
-    # sending them instead of the original source channel's name.
+    # Resolve the attribution text once if it doesn't depend on the target:
+    # a custom label always wins; otherwise "sender" mode auto-detects the
+    # sending account/bot's own name up front. "target" mode is resolved
+    # per-target inside the handler below, since each target has its own name.
     attribution = rule.get("attribution_label")
-    if not attribution and rule.get("hide_source"):
+    if not attribution and rule.get("hide_source") and rule.get("attribution_mode", "sender") == "sender":
         try:
             attribution = "via " + await _get_sender_display_name(sender_client)
         except Exception as e:
@@ -655,7 +760,12 @@ async def _start_rule_listener(rule_id: int):
 
         for target_id in current["target_ids"]:
             try:
-                await _deliver_message(current, reader, sender_client, event, target_id, text, attribution)
+                target_attribution = attribution
+                if (not current.get("attribution_label")
+                        and current.get("hide_source")
+                        and current.get("attribution_mode", "sender") == "target"):
+                    target_attribution = await _get_target_label(sender_client, target_id)
+                await _deliver_message(current, reader, sender_client, event, target_id, text, target_attribution)
                 await _log_history(rule_id, phone, event.chat_id, target_id, text)
             except Exception as e:
                 print(f"[forward error] rule_id={rule_id} target={target_id}: {e}")
