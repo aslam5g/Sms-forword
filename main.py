@@ -29,7 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, PeerFloodError, UserPrivacyRestrictedError, FloodWaitError
+from telethon.tl.functions.channels import InviteToChannelRequest
 
 app = FastAPI(title="Telegram Auto-Forwarder")
 
@@ -58,6 +59,7 @@ RULES = {}           # rule_id (int) -> rule dict
 RULE_HANDLERS = {}   # rule_id -> (TelegramClient, handler_function) so we can cleanly remove
                       # a rule's event handler when it's edited/stopped, instead of leaving
                       # stale handlers registered forever (which would double-forward messages)
+ADD_MEMBER_JOBS = {}  # job_id -> {"phone":, "status":, "total":, "done_count":, "results": [...]}
 TARGET_LABEL_CACHE = {}  # target_id -> "Title\nhttps://t.me/username" (or without link if private)
 SEEN_HASHES = {}     # rule_id -> deque of recent content hashes (bounded window)
 SEEN_SETS = {}       # rule_id -> set of the same hashes, for O(1) duplicate lookup
@@ -127,6 +129,14 @@ class RuleUpdateRequest(BaseModel):
     replace_rules: list[ReplaceRule] | None = None
     cleaner_options: CleanerOptions | None = None
     label: str | None = None
+
+
+class AddMembersRequest(BaseModel):
+    phone: str
+    token: str
+    target_id: int          # the channel/group to add people into (you must be admin)
+    usernames: list[str]    # e.g. ["@friend1", "friend2"]
+    delay_seconds: float = 8.0   # wait between each add to avoid PEER_FLOOD
 
 
 # ---------- Helpers ----------
@@ -219,108 +229,121 @@ async def on_startup():
     global db_pool
     if not DATABASE_URL:
         print("[warning] DATABASE_URL not set — nothing will survive restarts.")
+        asyncio.create_task(_connection_watchdog())
         return
 
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS telegram_users (
-                phone TEXT PRIMARY KEY,
-                session_string TEXT NOT NULL
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS auth_tokens (
-                token TEXT PRIMARY KEY,
-                phone TEXT NOT NULL
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS forward_rules (
-                id SERIAL PRIMARY KEY,
-                phone TEXT NOT NULL,
-                label TEXT,
-                source_ids TEXT NOT NULL,
-                target_ids TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                bot_token TEXT,
-                keywords TEXT,
-                hide_source BOOLEAN DEFAULT FALSE,
-                running BOOLEAN DEFAULT TRUE
-            );
-        """)
-        # In case this table already existed from the previous version, add the new column.
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS hide_source BOOLEAN DEFAULT FALSE;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_label TEXT;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS duplicate_filter BOOLEAN DEFAULT FALSE;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS header_text TEXT;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS footer_text TEXT;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS replace_rules TEXT;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS cleaner_options TEXT;
-        """)
-        await conn.execute("""
-            ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_mode TEXT DEFAULT 'sender';
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS forward_history (
-                id SERIAL PRIMARY KEY,
-                rule_id INTEGER,
-                phone TEXT,
-                source_id BIGINT,
-                target_id BIGINT,
-                preview TEXT,
-                created_at TIMESTAMPTZ DEFAULT now()
-            );
-        """)
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_users (
+                    phone TEXT PRIMARY KEY,
+                    session_string TEXT NOT NULL
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS auth_tokens (
+                    token TEXT PRIMARY KEY,
+                    phone TEXT NOT NULL
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS forward_rules (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT NOT NULL,
+                    label TEXT,
+                    source_ids TEXT NOT NULL,
+                    target_ids TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    bot_token TEXT,
+                    keywords TEXT,
+                    hide_source BOOLEAN DEFAULT FALSE,
+                    running BOOLEAN DEFAULT TRUE
+                );
+            """)
+            # In case this table already existed from the previous version, add the new column.
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS hide_source BOOLEAN DEFAULT FALSE;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_label TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS duplicate_filter BOOLEAN DEFAULT FALSE;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS header_text TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS footer_text TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS replace_rules TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS cleaner_options TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_mode TEXT DEFAULT 'sender';
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS forward_history (
+                    id SERIAL PRIMARY KEY,
+                    rule_id INTEGER,
+                    phone TEXT,
+                    source_id BIGINT,
+                    target_id BIGINT,
+                    preview TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+            """)
 
-    async with db_pool.acquire() as conn:
-        user_rows = await conn.fetch("SELECT * FROM telegram_users;")
-        token_rows = await conn.fetch("SELECT * FROM auth_tokens;")
-        rule_rows = await conn.fetch("SELECT * FROM forward_rules WHERE running = TRUE;")
+        async with db_pool.acquire() as conn:
+            user_rows = await conn.fetch("SELECT * FROM telegram_users;")
+            token_rows = await conn.fetch("SELECT * FROM auth_tokens;")
+            rule_rows = await conn.fetch("SELECT * FROM forward_rules WHERE running = TRUE;")
 
-    for row in user_rows:
-        USER_SESSIONS[row["phone"]] = row["session_string"]
+        for row in user_rows:
+            USER_SESSIONS[row["phone"]] = row["session_string"]
 
-    for row in token_rows:
-        AUTH_TOKENS[row["token"]] = row["phone"]
+        for row in token_rows:
+            AUTH_TOKENS[row["token"]] = row["phone"]
 
-    for row in rule_rows:
-        rule = {
-            "phone": row["phone"],
-            "label": row["label"],
-            "source_ids": [int(x) for x in row["source_ids"].split(",") if x],
-            "target_ids": [int(x) for x in row["target_ids"].split(",") if x],
-            "sender": row["sender"],
-            "bot_token": row["bot_token"],
-            "keywords": row["keywords"].split(",") if row["keywords"] else [],
-            "hide_source": row["hide_source"],
-            "attribution_label": row["attribution_label"],
-            "duplicate_filter": row["duplicate_filter"],
-            "header_text": row["header_text"],
-            "footer_text": row["footer_text"],
-            "replace_rules": json.loads(row["replace_rules"]) if row["replace_rules"] else [],
-            "cleaner_options": json.loads(row["cleaner_options"]) if row["cleaner_options"] else None,
-            "attribution_mode": row["attribution_mode"] or "sender",
-            "running": True,
-        }
-        RULES[row["id"]] = rule
-        asyncio.create_task(_start_rule_listener(row["id"]))
-        print(f"[resume] auto-resumed rule id={row['id']} phone={row['phone']}")
+        for row in rule_rows:
+            rule = {
+                "phone": row["phone"],
+                "label": row["label"],
+                "source_ids": [int(x) for x in row["source_ids"].split(",") if x],
+                "target_ids": [int(x) for x in row["target_ids"].split(",") if x],
+                "sender": row["sender"],
+                "bot_token": row["bot_token"],
+                "keywords": row["keywords"].split(",") if row["keywords"] else [],
+                "hide_source": row["hide_source"],
+                "attribution_label": row["attribution_label"],
+                "duplicate_filter": row["duplicate_filter"],
+                "header_text": row["header_text"],
+                "footer_text": row["footer_text"],
+                "replace_rules": json.loads(row["replace_rules"]) if row["replace_rules"] else [],
+                "cleaner_options": json.loads(row["cleaner_options"]) if row["cleaner_options"] else None,
+                "attribution_mode": row["attribution_mode"] or "sender",
+                "running": True,
+            }
+            RULES[row["id"]] = rule
+            asyncio.create_task(_start_rule_listener(row["id"]))
+            print(f"[resume] auto-resumed rule id={row['id']} phone={row['phone']}")
 
-    print(f"[startup] loaded {len(user_rows)} user(s) and {len(rule_rows)} active rule(s) from database.")
+        print(f"[startup] loaded {len(user_rows)} user(s) and {len(rule_rows)} active rule(s) from database.")
+
+    except Exception as e:
+        # CRITICAL: if the database is unreachable (e.g. Render's free Postgres
+        # expired after 90 days, wrong credentials, network hiccup), we must NOT
+        # let this exception escape — otherwise FastAPI/Uvicorn fails to start
+        # and the entire server stays down until a manual redeploy. Instead we
+        # log it clearly and keep running in memory-only mode (existing rules
+        # won't auto-resume, but the API stays alive and new logins/rules work
+        # for the rest of this process's lifetime).
+        db_pool = None
+        print(f"[CRITICAL] Database initialization failed — running in memory-only mode. Error: {e}")
 
     # Periodically check cached reader/bot clients and reconnect any that have
     # silently dropped, instead of only discovering this the next time a
@@ -761,6 +784,89 @@ async def get_history(phone: str, token: str, limit: int = 50):
             for r in rows
         ]
     }
+
+
+# ---------- 6. Add known contacts to a channel/group by username ----------
+@app.post("/tools/add-members")
+async def add_members(req: AddMembersRequest):
+    if _phone_for_token(req.token) != req.phone:
+        raise HTTPException(401, "Token does not match this phone.")
+    if req.phone not in USER_SESSIONS:
+        raise HTTPException(401, "Not logged in.")
+    if not req.usernames:
+        raise HTTPException(400, "Provide at least one username.")
+    if len(req.usernames) > 200:
+        raise HTTPException(400, "Max 200 usernames per job. Telegram's own daily add-limit "
+                                   "(often much lower than this, especially for newer accounts) "
+                                   "will likely stop the batch before it reaches this anyway — "
+                                   "that's expected safety behavior, not a bug.")
+
+    job_id = secrets.token_hex(8)
+    ADD_MEMBER_JOBS[job_id] = {
+        "phone": req.phone,
+        "status": "running",
+        "total": len(req.usernames),
+        "done_count": 0,
+        "results": [],
+    }
+    asyncio.create_task(_run_add_members(job_id, req))
+    return {"job_id": job_id, "message": f"Started adding {len(req.usernames)} people."}
+
+
+@app.get("/tools/add-members/{job_id}")
+async def get_add_members_job(job_id: str, token: str):
+    job = ADD_MEMBER_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    if _phone_for_token(token) != job["phone"]:
+        raise HTTPException(401, "Not authorized for this job.")
+    return job
+
+
+async def _run_add_members(job_id: str, req: AddMembersRequest):
+    job = ADD_MEMBER_JOBS[job_id]
+    reader = await _get_reader(req.phone)
+
+    try:
+        target = await reader.get_entity(req.target_id)
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = f"Could not resolve target channel/group: {e}"
+        return
+
+    for uname in req.usernames:
+        entry = {"username": uname}
+        clean = uname if uname.startswith("@") else "@" + uname
+        try:
+            user = await reader.get_entity(clean)
+            await reader(InviteToChannelRequest(target, [user]))
+            entry["status"] = "added"
+        except UserPrivacyRestrictedError:
+            entry["status"] = "failed"
+            entry["error"] = "user's privacy settings don't allow being added by bots/strangers"
+        except PeerFloodError:
+            entry["status"] = "failed"
+            entry["error"] = "Telegram rate-limited this account (PeerFlood) — stopping the rest of the batch"
+            job["results"].append(entry)
+            job["done_count"] = len(job["results"])
+            job["status"] = "stopped_flood"
+            return
+        except FloodWaitError as e:
+            entry["status"] = "failed"
+            entry["error"] = f"Telegram asked to wait {e.seconds}s — stopping the rest of the batch"
+            job["results"].append(entry)
+            job["done_count"] = len(job["results"])
+            job["status"] = "stopped_flood"
+            return
+        except Exception as e:
+            entry["status"] = "failed"
+            entry["error"] = str(e)
+
+        job["results"].append(entry)
+        job["done_count"] = len(job["results"])
+        await asyncio.sleep(req.delay_seconds)
+
+    job["status"] = "done"
 
 
 # ---------- Background listener ----------
