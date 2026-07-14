@@ -322,6 +322,31 @@ async def on_startup():
 
     print(f"[startup] loaded {len(user_rows)} user(s) and {len(rule_rows)} active rule(s) from database.")
 
+    # Periodically check cached reader/bot clients and reconnect any that have
+    # silently dropped, instead of only discovering this the next time a
+    # message tries to use them (which could be hours later, or never, if the
+    # source channel goes quiet).
+    asyncio.create_task(_connection_watchdog())
+
+
+async def _connection_watchdog():
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        for phone, client in list(READERS.items()):
+            try:
+                if not client.is_connected():
+                    print(f"[watchdog] reader for {phone} disconnected, reconnecting...")
+                    await client.connect()
+            except Exception as e:
+                print(f"[watchdog] reader reconnect failed for {phone}: {e}")
+        for bot_token, client in list(BOT_CLIENTS.items()):
+            try:
+                if not client.is_connected():
+                    print(f"[watchdog] bot client disconnected, reconnecting...")
+                    await client.connect()
+            except Exception as e:
+                print(f"[watchdog] bot reconnect failed: {e}")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -460,10 +485,14 @@ async def _log_history(rule_id: int, phone: str, source_id: int, target_id: int,
 
 @app.get("/health")
 async def health():
+    reader_status = {phone: c.is_connected() for phone, c in READERS.items()}
+    bot_status = {token[:8] + "...": c.is_connected() for token, c in BOT_CLIENTS.items()}
     return {
         "status": "ok",
         "active_rules": len([r for r in RULES.values() if r["running"]]),
         "db_connected": db_pool is not None,
+        "readers_connected": reader_status,
+        "bots_connected": bot_status,
     }
 
 
@@ -736,8 +765,27 @@ async def get_history(phone: str, token: str, limit: int = 50):
 
 # ---------- Background listener ----------
 async def _get_reader(phone: str) -> TelegramClient:
+    """
+    Returns a connected TelegramClient for this phone, reusing the cached one
+    only if it's still actually connected. Without this check, a silently
+    dropped connection (e.g. a brief network blip) would stay cached forever,
+    and every rule using this phone would stop forwarding permanently even
+    though nothing in the UI showed an error.
+    """
     if phone in READERS:
-        return READERS[phone]
+        existing = READERS[phone]
+        if existing.is_connected():
+            return existing
+        print(f"[reader] {phone} was disconnected, attempting reconnect...")
+        try:
+            await existing.connect()
+            if existing.is_connected():
+                print(f"[reader] {phone} reconnected successfully.")
+                return existing
+        except Exception as e:
+            print(f"[reader] reconnect failed for {phone}: {e}")
+        READERS.pop(phone, None)  # reconnect failed — drop it, build fresh below
+
     session_string = USER_SESSIONS[phone]
     reader = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await reader.connect()
@@ -755,7 +803,19 @@ async def _get_reader(phone: str) -> TelegramClient:
 
 async def _get_bot_client(bot_token: str) -> TelegramClient:
     if bot_token in BOT_CLIENTS:
-        return BOT_CLIENTS[bot_token]
+        existing = BOT_CLIENTS[bot_token]
+        if existing.is_connected():
+            return existing
+        print("[bot] client was disconnected, attempting reconnect...")
+        try:
+            await existing.connect()
+            if existing.is_connected():
+                print("[bot] reconnected successfully.")
+                return existing
+        except Exception as e:
+            print(f"[bot] reconnect failed: {e}")
+        BOT_CLIENTS.pop(bot_token, None)
+
     bot = TelegramClient(StringSession(), API_ID, API_HASH)
     await bot.start(bot_token=bot_token)
     try:
