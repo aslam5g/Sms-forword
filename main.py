@@ -55,6 +55,9 @@ AUTH_TOKENS = {}     # token -> phone (persistent login, survives app restarts o
 READERS = {}         # phone -> a single shared TelegramClient used to listen for that phone
 BOT_CLIENTS = {}     # bot_token -> TelegramClient (reused across rules using the same bot)
 RULES = {}           # rule_id (int) -> rule dict
+RULE_HANDLERS = {}   # rule_id -> (TelegramClient, handler_function) so we can cleanly remove
+                      # a rule's event handler when it's edited/stopped, instead of leaving
+                      # stale handlers registered forever (which would double-forward messages)
 TARGET_LABEL_CACHE = {}  # target_id -> "Title\nhttps://t.me/username" (or without link if private)
 SEEN_HASHES = {}     # rule_id -> deque of recent content hashes (bounded window)
 SEEN_SETS = {}       # rule_id -> set of the same hashes, for O(1) duplicate lookup
@@ -108,6 +111,22 @@ class RuleCreateRequest(BaseModel):
     footer_text: str | None = None  # NEW: text appended to every forwarded message
     replace_rules: list[ReplaceRule] | None = None  # NEW: find/replace pairs applied to text
     cleaner_options: CleanerOptions | None = None  # NEW: strip links/mentions/emojis/hashtags
+
+
+class RuleUpdateRequest(BaseModel):
+    token: str
+    source_ids: list[int] | None = None
+    target_ids: list[int] | None = None
+    keywords: list[str] | None = None
+    hide_source: bool | None = None
+    attribution_label: str | None = None
+    attribution_mode: str | None = None
+    duplicate_filter: bool | None = None
+    header_text: str | None = None
+    footer_text: str | None = None
+    replace_rules: list[ReplaceRule] | None = None
+    cleaner_options: CleanerOptions | None = None
+    label: str | None = None
 
 
 # ---------- Helpers ----------
@@ -377,6 +396,44 @@ async def _insert_rule_db(rule: dict) -> int:
         return row["id"]
 
 
+async def _update_rule_db(rule_id: int, rule: dict):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE forward_rules SET
+                label = $2, source_ids = $3, target_ids = $4, keywords = $5,
+                hide_source = $6, attribution_label = $7, duplicate_filter = $8,
+                header_text = $9, footer_text = $10, replace_rules = $11,
+                cleaner_options = $12, attribution_mode = $13
+            WHERE id = $1;
+        """,
+            rule_id, rule.get("label"),
+            ",".join(str(x) for x in rule["source_ids"]),
+            ",".join(str(x) for x in rule["target_ids"]),
+            ",".join(rule["keywords"]) if rule["keywords"] else None,
+            rule["hide_source"], rule.get("attribution_label"),
+            rule.get("duplicate_filter", False),
+            rule.get("header_text"), rule.get("footer_text"),
+            json.dumps(rule["replace_rules"]) if rule.get("replace_rules") else None,
+            json.dumps(rule["cleaner_options"]) if rule.get("cleaner_options") else None,
+            rule.get("attribution_mode", "sender"),
+        )
+
+
+def _remove_rule_handler(rule_id: int):
+    """Immediately unregisters a rule's event handler from its Telegram client.
+    Must be called before re-registering a new one on edit, otherwise the old
+    handler stays active forever and messages get forwarded twice."""
+    stored = RULE_HANDLERS.pop(rule_id, None)
+    if stored:
+        client, handler = stored
+        try:
+            client.remove_event_handler(handler)
+        except Exception as e:
+            print(f"[handler removal failed] rule_id={rule_id}: {e}")
+
+
 async def _mark_rule_stopped(rule_id: int):
     if not db_pool:
         return
@@ -554,7 +611,7 @@ async def create_rule(req: RuleCreateRequest):
         "footer_text": (req.footer_text or "").strip() or None,
         "replace_rules": [r.dict() for r in (req.replace_rules or [])],
         "cleaner_options": req.cleaner_options.dict() if req.cleaner_options else None,
-        "attribution_mode": req.attribution_mode if req.attribution_mode in ("sender", "target") else "sender",
+        "attribution_mode": req.attribution_mode if req.attribution_mode in ("sender", "target", "none") else "sender",
         "running": True,
     }
 
@@ -568,6 +625,56 @@ async def create_rule(req: RuleCreateRequest):
     return {"message": "Rule created and started.", "rule_id": rule_id}
 
 
+@app.patch("/forward/rules/{rule_id}")
+async def update_rule(rule_id: int, req: RuleUpdateRequest):
+    rule = RULES.get(rule_id)
+    if not rule:
+        raise HTTPException(404, "Rule not found.")
+    if _phone_for_token(req.token) != rule["phone"]:
+        raise HTTPException(401, "Not authorized for this rule.")
+
+    if req.source_ids is not None:
+        if not req.source_ids:
+            raise HTTPException(400, "source_ids cannot be empty.")
+        rule["source_ids"] = req.source_ids
+    if req.target_ids is not None:
+        if not req.target_ids:
+            raise HTTPException(400, "target_ids cannot be empty.")
+        rule["target_ids"] = req.target_ids
+    if req.keywords is not None:
+        rule["keywords"] = [k.strip() for k in req.keywords if k.strip()]
+    if req.hide_source is not None:
+        rule["hide_source"] = req.hide_source
+    if req.attribution_label is not None:
+        rule["attribution_label"] = req.attribution_label.strip() or None
+    if req.attribution_mode is not None and req.attribution_mode in ("sender", "target", "none"):
+        rule["attribution_mode"] = req.attribution_mode
+    if req.duplicate_filter is not None:
+        rule["duplicate_filter"] = req.duplicate_filter
+    if req.header_text is not None:
+        rule["header_text"] = req.header_text.strip() or None
+    if req.footer_text is not None:
+        rule["footer_text"] = req.footer_text.strip() or None
+    if req.replace_rules is not None:
+        rule["replace_rules"] = [r.dict() for r in req.replace_rules]
+    if req.cleaner_options is not None:
+        rule["cleaner_options"] = req.cleaner_options.dict()
+    if req.label is not None:
+        rule["label"] = req.label.strip() or rule.get("label")
+
+    await _update_rule_db(rule_id, rule)
+
+    # Restart the listener so the change actually takes effect: the source-chat
+    # filter and attribution text are fixed at registration time, so editing
+    # them requires tearing down the old handler and registering a fresh one.
+    _remove_rule_handler(rule_id)
+    rule["running"] = True
+    await _mark_rule_running(rule_id)
+    asyncio.create_task(_start_rule_listener(rule_id))
+
+    return {"message": "Rule updated.", "rule_id": rule_id}
+
+
 @app.post("/forward/rules/{rule_id}/stop")
 async def stop_rule(rule_id: int, token: str):
     rule = RULES.get(rule_id)
@@ -576,6 +683,7 @@ async def stop_rule(rule_id: int, token: str):
     if _phone_for_token(token) != rule["phone"]:
         raise HTTPException(401, "Not authorized for this rule.")
     rule["running"] = False
+    _remove_rule_handler(rule_id)
     await _mark_rule_stopped(rule_id)
     return {"message": "Rule stopped."}
 
@@ -588,6 +696,7 @@ async def delete_rule(rule_id: int, token: str):
     if _phone_for_token(token) != rule["phone"]:
         raise HTTPException(401, "Not authorized for this rule.")
     rule["running"] = False
+    _remove_rule_handler(rule_id)
     await _delete_rule_db(rule_id)
     del RULES[rule_id]
     SEEN_HASHES.pop(rule_id, None)
@@ -746,13 +855,20 @@ async def _start_rule_listener(rule_id: int):
     # a custom label always wins; otherwise "sender" mode auto-detects the
     # sending account/bot's own name up front. "target" mode is resolved
     # per-target inside the handler below, since each target has its own name.
-    attribution = rule.get("attribution_label")
-    if not attribution and rule.get("hide_source") and rule.get("attribution_mode", "sender") == "sender":
-        try:
-            attribution = "via " + await _get_sender_display_name(sender_client)
-        except Exception as e:
-            print(f"[attribution lookup failed] rule_id={rule_id}: {e}")
-            attribution = None
+    attribution = None
+    if rule.get("hide_source"):
+        mode = rule.get("attribution_mode", "sender")
+        if mode == "none":
+            attribution = None  # user explicitly wants no attribution line at all
+        else:
+            attribution = rule.get("attribution_label")
+            if not attribution and mode == "sender":
+                try:
+                    attribution = "via " + await _get_sender_display_name(sender_client)
+                except Exception as e:
+                    print(f"[attribution lookup failed] rule_id={rule_id}: {e}")
+                    attribution = None
+            # mode == "target" is resolved per-target inside the handler below.
 
     @reader.on(events.NewMessage(chats=rule["source_ids"]))
     async def handler(event, rule_id=rule_id):
@@ -782,9 +898,15 @@ async def _start_rule_listener(rule_id: int):
             except Exception as e:
                 print(f"[forward error] rule_id={rule_id} target={target_id}: {e}")
 
+    RULE_HANDLERS[rule_id] = (reader, handler)
+
     print(f"[listener] rule_id={rule_id} phone={phone} sources={rule['source_ids']} "
           f"hide_source={rule.get('hide_source')} attribution={attribution!r} keywords={rule['keywords']}")
     while RULES.get(rule_id, {}).get("running"):
         await asyncio.sleep(1)
 
+    # Only remove if this exact handler is still the registered one (an edit
+    # may have already swapped it out and started a newer listener task).
+    if RULE_HANDLERS.get(rule_id) == (reader, handler):
+        _remove_rule_handler(rule_id)
     print(f"[listener] rule_id={rule_id} stopped.")
