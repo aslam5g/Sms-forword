@@ -506,7 +506,7 @@ async def _log_history(rule_id: int, phone: str, source_id: int, target_id: int,
         """, rule_id, phone, source_id, target_id, (preview or "")[:200])
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     reader_status = {phone: c.is_connected() for phone, c in READERS.items()}
     bot_status = {token[:8] + "...": c.is_connected() for token, c in BOT_CLIENTS.items()}
@@ -924,26 +924,27 @@ async def _get_bot_client(bot_token: str) -> TelegramClient:
 
     bot = TelegramClient(StringSession(), API_ID, API_HASH)
     await bot.start(bot_token=bot_token)
-    try:
-        await bot.get_dialogs(limit=None)
-    except Exception as e:
-        print(f"[bot] warning: could not preload dialogs: {e}")
+    # NOTE: we deliberately do NOT call bot.get_dialogs() here — Telegram's API
+    # forbids bot accounts from calling that method at all (GetDialogsRequest is
+    # restricted for bots), it would always fail. Instead, target entities are
+    # resolved via the user's own account (which already has them cached) and
+    # passed to the bot pre-resolved — see _start_rule_listener.
     BOT_CLIENTS[bot_token] = bot
     return bot
 
 
-async def _get_target_label(client: TelegramClient, target_id: int) -> str:
+async def _get_target_label(target_entity, target_id: int) -> str:
     """
     Returns a label for the TARGET chat itself — its title, plus a t.me link if
     it's public — so a forwarded message can show "posted in <this channel>"
     instead of "Forwarded from <original source>". Cached since it rarely changes.
+    Takes an already-resolved entity (see note in _deliver_message about why).
     """
     if target_id in TARGET_LABEL_CACHE:
         return TARGET_LABEL_CACHE[target_id]
     try:
-        entity = await client.get_entity(target_id)
-        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or "Channel"
-        username = getattr(entity, "username", None)
+        title = getattr(target_entity, "title", None) or getattr(target_entity, "first_name", None) or "Channel"
+        username = getattr(target_entity, "username", None)
         label = f"{title}\nhttps://t.me/{username}" if username else title
     except Exception as e:
         print(f"[target label lookup failed] target={target_id}: {e}")
@@ -979,13 +980,19 @@ def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
 
 
 async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: TelegramClient,
-                            event, target_id: int, text: str, attribution: str | None):
+                            event, target_entity, text: str, attribution: str | None):
     """
-    Sends the message to target_id either as:
+    Sends the message to target_entity either as:
     - a native Telegram forward (keeps "Forwarded from <original source>" tag), or
     - a fresh copy if rule['hide_source'] is True, sender is a bot, or a header/footer/
       replace rule/cleaner option is configured (native forwards can't be edited, so
       any of these force copy mode).
+
+    `target_entity` must already be a resolved Telethon entity (not a bare int id).
+    This matters especially for bot senders: bots cannot call get_dialogs() to build
+    their own entity cache (Telegram forbids it for bot accounts), so a bare channel
+    ID would fail to resolve. Resolving it via the user's account first and handing
+    the bot the already-resolved entity sidesteps that restriction entirely.
     """
     use_copy_mode = (
         rule["sender"] == "bot"
@@ -999,11 +1006,11 @@ async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: Te
     if use_copy_mode:
         final_text = _compose_final_text(rule, attribution, text)
         if event.message.media:
-            await sender_client.send_file(target_id, event.message.media, caption=final_text)
+            await sender_client.send_file(target_entity, event.message.media, caption=final_text)
         else:
-            await sender_client.send_message(target_id, final_text)
+            await sender_client.send_message(target_entity, final_text)
     else:
-        await reader.forward_messages(target_id, event.message)
+        await reader.forward_messages(target_entity, event.message)
 
 
 async def _start_rule_listener(rule_id: int):
@@ -1054,12 +1061,17 @@ async def _start_rule_listener(rule_id: int):
 
         for target_id in current["target_ids"]:
             try:
+                # Always resolve via the user's own account first — it already has
+                # every dialog cached (from _get_reader's preload), including chats
+                # a bot could never look up on its own.
+                target_entity = await reader.get_entity(target_id)
+
                 target_attribution = attribution
                 if (not current.get("attribution_label")
                         and current.get("hide_source")
                         and current.get("attribution_mode", "sender") == "target"):
-                    target_attribution = await _get_target_label(sender_client, target_id)
-                await _deliver_message(current, reader, sender_client, event, target_id, text, target_attribution)
+                    target_attribution = await _get_target_label(target_entity, target_id)
+                await _deliver_message(current, reader, sender_client, event, target_entity, text, target_attribution)
                 await _log_history(rule_id, phone, event.chat_id, target_id, text)
             except Exception as e:
                 print(f"[forward error] rule_id={rule_id} target={target_id}: {e}")
