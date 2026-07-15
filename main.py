@@ -1061,17 +1061,36 @@ async def _start_rule_listener(rule_id: int):
 
         for target_id in current["target_ids"]:
             try:
-                # Always resolve via the user's own account first — it already has
-                # every dialog cached (from _get_reader's preload), including chats
-                # a bot could never look up on its own.
-                target_entity = await reader.get_entity(target_id)
+                # The user's own account can always resolve any target it's a
+                # member/admin of (dialogs were preloaded in _get_reader).
+                reader_entity = await reader.get_entity(target_id)
+
+                if current["sender"] == "bot":
+                    # IMPORTANT: a channel's access_hash is specific to the
+                    # session that resolved it. The account's resolved entity
+                    # is NOT valid for the bot's own connection — using it
+                    # causes Telethon's "Invalid channel object" error. The
+                    # bot must resolve the target itself, which only works via
+                    # a public @username (bots can't use get_dialogs or bare
+                    # numeric IDs the way user accounts can).
+                    target_username = getattr(reader_entity, "username", None)
+                    if not target_username:
+                        raise RuntimeError(
+                            "Bot sender needs the target channel/group to have a public "
+                            "@username — bots can't resolve a private target by numeric ID "
+                            "alone. Either set a username on the target, or switch this "
+                            "rule's sender to your own account."
+                        )
+                    send_entity = await sender_client.get_entity(target_username)
+                else:
+                    send_entity = reader_entity
 
                 target_attribution = attribution
                 if (not current.get("attribution_label")
                         and current.get("hide_source")
                         and current.get("attribution_mode", "sender") == "target"):
-                    target_attribution = await _get_target_label(target_entity, target_id)
-                await _deliver_message(current, reader, sender_client, event, target_entity, text, target_attribution)
+                    target_attribution = await _get_target_label(reader_entity, target_id)
+                await _deliver_message(current, reader, sender_client, event, send_entity, text, target_attribution)
                 await _log_history(rule_id, phone, event.chat_id, target_id, text)
             except Exception as e:
                 print(f"[forward error] rule_id={rule_id} target={target_id}: {e}")
