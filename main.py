@@ -113,6 +113,14 @@ class RuleCreateRequest(BaseModel):
     footer_text: str | None = None  # NEW: text appended to every forwarded message
     replace_rules: list[ReplaceRule] | None = None  # NEW: find/replace pairs applied to text
     cleaner_options: CleanerOptions | None = None  # NEW: strip links/mentions/emojis/hashtags
+    copy_patterns: list[str] | None = None  # NEW: per-rule regex patterns (auto-derived from an
+                                              # example the user marks) that get wrapped in
+                                              # Telegram's tap-to-copy code formatting. Different
+                                              # rules (different source channels) can each have
+                                              # their own pattern, since post formats vary.
+    code_format_enabled: bool = False  # NEW: master on/off switch for the tap-to-copy feature.
+                                         # When on with no custom copy_patterns, falls back to a
+                                         # generic strict letter+digit pattern.
 
 
 class RuleUpdateRequest(BaseModel):
@@ -128,6 +136,8 @@ class RuleUpdateRequest(BaseModel):
     footer_text: str | None = None
     replace_rules: list[ReplaceRule] | None = None
     cleaner_options: CleanerOptions | None = None
+    copy_patterns: list[str] | None = None
+    code_format_enabled: bool | None = None
     label: str | None = None
 
 
@@ -184,6 +194,88 @@ def _apply_cleaner(text: str, options: dict | None) -> str:
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+_MD_SPECIAL_CHARS = re.compile(r'([\\*_`\[\]])')
+
+
+def _escape_markdown(text: str) -> str:
+    """Escapes characters that have special meaning in Telegram's markdown parse
+    mode, so the original message content doesn't accidentally trigger bold/
+    italic/code formatting on its own — only our deliberately-inserted code
+    backticks (added afterwards) should be interpreted as formatting."""
+    return _MD_SPECIAL_CHARS.sub(r'\\\1', text)
+
+
+_DEFAULT_CODE_PATTERN = re.compile(
+    r'\b(?=[A-Z0-9]{5,14}\b)(?=[A-Z0-9]*[0-9])(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,14}\b'
+)
+
+MAX_COPY_PATTERNS_PER_RULE = 10
+MAX_PATTERN_LENGTH = 120
+
+
+def build_pattern_from_example(example_token: str) -> str:
+    """
+    Given a single example token the user marked as "this is the code" (e.g.
+    "6GED7TLK"), derives a regex that generalizes it: same character class
+    (digits-only / letters-only / mixed) and a length window around the
+    example's length (so future codes a bit shorter/longer still match).
+    This is what powers the per-rule "learn from an example post" feature.
+    """
+    example_token = example_token.strip()
+    has_digit = any(c.isdigit() for c in example_token)
+    has_upper = any(c.isalpha() and c.isupper() for c in example_token)
+    has_lower = any(c.isalpha() and c.islower() for c in example_token)
+
+    if has_digit and has_upper and has_lower:
+        charclass = "A-Za-z0-9"
+    elif has_digit and has_upper:
+        charclass = "A-Z0-9"
+    elif has_digit and has_lower:
+        charclass = "a-z0-9"
+    elif has_upper:
+        charclass = "A-Z0-9"  # letters-only example: still allow digits too, common in codes
+    elif has_lower:
+        charclass = "a-z0-9"
+    else:
+        charclass = "0-9"
+
+    length = len(example_token)
+    lo = max(3, length - 2)
+    hi = length + 2
+    return rf'\b[{charclass}]{{{lo},{hi}}}\b'
+
+
+def _compile_safe_pattern(pattern: str):
+    """Compiles a user/derived pattern with basic sanity limits, so a
+    malformed or oversized pattern can't break forwarding or hang the process.
+    Returns None (and logs) if the pattern is unsafe or invalid."""
+    if not pattern or len(pattern) > MAX_PATTERN_LENGTH:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as e:
+        print(f"[copy pattern] invalid pattern skipped: {pattern!r} ({e})")
+        return None
+
+
+def _apply_code_formatting(text: str, patterns: list[str] | None) -> str:
+    """
+    Wraps tokens matching this rule's custom copy_patterns (derived from an
+    example the user marked) in backticks, so Telegram renders them as
+    monospace/code text — which every Telegram client makes tap-to-copy
+    automatically. Falls back to a generic strict letter+digit pattern if the
+    rule has no custom patterns of its own.
+    """
+    active_patterns = [p for p in (patterns or [])[:MAX_COPY_PATTERNS_PER_RULE]]
+    compiled = [c for c in (_compile_safe_pattern(p) for p in active_patterns) if c]
+    if not compiled:
+        compiled = [_DEFAULT_CODE_PATTERN]
+
+    for pattern in compiled:
+        text = pattern.sub(lambda m: f"`{m.group(0)}`", text)
+    return text
 
 
 def _apply_replacements(text: str, replace_rules: list) -> str:
@@ -287,6 +379,12 @@ async def on_startup():
                 ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS attribution_mode TEXT DEFAULT 'sender';
             """)
             await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS copy_patterns TEXT;
+            """)
+            await conn.execute("""
+                ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS code_format_enabled BOOLEAN DEFAULT FALSE;
+            """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS forward_history (
                     id SERIAL PRIMARY KEY,
                     rule_id INTEGER,
@@ -326,6 +424,8 @@ async def on_startup():
                 "replace_rules": json.loads(row["replace_rules"]) if row["replace_rules"] else [],
                 "cleaner_options": json.loads(row["cleaner_options"]) if row["cleaner_options"] else None,
                 "attribution_mode": row["attribution_mode"] or "sender",
+                "copy_patterns": json.loads(row["copy_patterns"]) if row["copy_patterns"] else [],
+                "code_format_enabled": row["code_format_enabled"] or False,
                 "running": True,
             }
             RULES[row["id"]] = rule
@@ -423,8 +523,8 @@ async def _insert_rule_db(rule: dict) -> int:
         return -1
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, duplicate_filter, header_text, footer_text, replace_rules, cleaner_options, attribution_mode, running)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
+            INSERT INTO forward_rules (phone, label, source_ids, target_ids, sender, bot_token, keywords, hide_source, attribution_label, duplicate_filter, header_text, footer_text, replace_rules, cleaner_options, attribution_mode, copy_patterns, code_format_enabled, running)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, TRUE)
             RETURNING id;
         """,
             rule["phone"], rule.get("label"),
@@ -440,6 +540,8 @@ async def _insert_rule_db(rule: dict) -> int:
             json.dumps(rule["replace_rules"]) if rule.get("replace_rules") else None,
             json.dumps(rule["cleaner_options"]) if rule.get("cleaner_options") else None,
             rule.get("attribution_mode", "sender"),
+            json.dumps(rule["copy_patterns"]) if rule.get("copy_patterns") else None,
+            rule.get("code_format_enabled", False),
         )
         return row["id"]
 
@@ -453,7 +555,7 @@ async def _update_rule_db(rule_id: int, rule: dict):
                 label = $2, source_ids = $3, target_ids = $4, keywords = $5,
                 hide_source = $6, attribution_label = $7, duplicate_filter = $8,
                 header_text = $9, footer_text = $10, replace_rules = $11,
-                cleaner_options = $12, attribution_mode = $13
+                cleaner_options = $12, attribution_mode = $13, copy_patterns = $14, code_format_enabled = $15
             WHERE id = $1;
         """,
             rule_id, rule.get("label"),
@@ -466,6 +568,8 @@ async def _update_rule_db(rule_id: int, rule: dict):
             json.dumps(rule["replace_rules"]) if rule.get("replace_rules") else None,
             json.dumps(rule["cleaner_options"]) if rule.get("cleaner_options") else None,
             rule.get("attribution_mode", "sender"),
+            json.dumps(rule["copy_patterns"]) if rule.get("copy_patterns") else None,
+            rule.get("code_format_enabled", False),
         )
 
 
@@ -634,6 +738,8 @@ async def get_rules(phone: str, token: str):
                 "replace_rules": rule.get("replace_rules") or [],
                 "cleaner_options": rule.get("cleaner_options"),
                 "attribution_mode": rule.get("attribution_mode", "sender"),
+                "copy_patterns": rule.get("copy_patterns") or [],
+                "code_format_enabled": rule.get("code_format_enabled", False),
                 "running": rule["running"],
             })
     return {"rules": result}
@@ -664,6 +770,8 @@ async def create_rule(req: RuleCreateRequest):
         "replace_rules": [r.dict() for r in (req.replace_rules or [])],
         "cleaner_options": req.cleaner_options.dict() if req.cleaner_options else None,
         "attribution_mode": req.attribution_mode if req.attribution_mode in ("sender", "target", "none") else "sender",
+        "copy_patterns": [p for p in (req.copy_patterns or []) if p.strip()],
+        "code_format_enabled": req.code_format_enabled,
         "running": True,
     }
 
@@ -711,6 +819,10 @@ async def update_rule(rule_id: int, req: RuleUpdateRequest):
         rule["replace_rules"] = [r.dict() for r in req.replace_rules]
     if req.cleaner_options is not None:
         rule["cleaner_options"] = req.cleaner_options.dict()
+    if req.copy_patterns is not None:
+        rule["copy_patterns"] = [p for p in req.copy_patterns if p.strip()]
+    if req.code_format_enabled is not None:
+        rule["code_format_enabled"] = req.code_format_enabled
     if req.label is not None:
         rule["label"] = req.label.strip() or rule.get("label")
 
@@ -963,11 +1075,22 @@ async def _get_sender_display_name(sender_client: TelegramClient) -> str:
     return (first + " " + last).strip() or "Unknown"
 
 
-def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
+def _compose_final_text(rule: dict, attribution: str | None, text: str) -> tuple[str, bool]:
     """Builds the outgoing message: attribution line, then header, then the
-    cleaned + find/replace-processed original text, then footer — each optional."""
+    cleaned + find/replace-processed original text, then footer — each optional.
+    Returns (final_text, use_markdown) — use_markdown is True only when the
+    tap-to-copy feature inserted backtick formatting that needs to be parsed."""
     text = _apply_cleaner(text, rule.get("cleaner_options"))
     text = _apply_replacements(text, rule.get("replace_rules"))
+
+    use_markdown = False
+    if rule.get("code_format_enabled"):
+        escaped = _escape_markdown(text)
+        formatted = _apply_code_formatting(escaped, rule.get("copy_patterns"))
+        if formatted != escaped:
+            text = formatted
+            use_markdown = True
+
     parts = []
     if attribution:
         parts.append(attribution)
@@ -976,7 +1099,7 @@ def _compose_final_text(rule: dict, attribution: str | None, text: str) -> str:
     parts.append(text)
     if rule.get("footer_text"):
         parts.append(rule["footer_text"])
-    return "\n\n".join(p for p in parts if p)
+    return "\n\n".join(p for p in parts if p), use_markdown
 
 
 async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: TelegramClient,
@@ -1001,14 +1124,16 @@ async def _deliver_message(rule: dict, reader: TelegramClient, sender_client: Te
         or bool(rule.get("footer_text"))
         or bool(rule.get("replace_rules"))
         or bool(rule.get("cleaner_options") and any(rule["cleaner_options"].values()))
+        or bool(rule.get("code_format_enabled"))
     )
 
     if use_copy_mode:
-        final_text = _compose_final_text(rule, attribution, text)
+        final_text, use_markdown = _compose_final_text(rule, attribution, text)
+        parse_mode = "markdown" if use_markdown else None
         if event.message.media:
-            await sender_client.send_file(target_entity, event.message.media, caption=final_text)
+            await sender_client.send_file(target_entity, event.message.media, caption=final_text, parse_mode=parse_mode)
         else:
-            await sender_client.send_message(target_entity, final_text)
+            await sender_client.send_message(target_entity, final_text, parse_mode=parse_mode)
     else:
         await reader.forward_messages(target_entity, event.message)
 
